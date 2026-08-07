@@ -1,10 +1,16 @@
+from typing import TYPE_CHECKING as _TYPE_CHECKING
+
 from ._gui_api import GuiApi as GuiApi
+from ._gui_handles import CommandEvent as CommandEvent
+from ._gui_handles import CommandHandle as CommandHandle
 from ._gui_handles import GuiButtonGroupHandle as GuiButtonGroupHandle
 from ._gui_handles import GuiButtonHandle as GuiButtonHandle
 from ._gui_handles import GuiCheckboxHandle as GuiCheckboxHandle
+from ._gui_handles import GuiDividerHandle as GuiDividerHandle
 from ._gui_handles import GuiDropdownHandle as GuiDropdownHandle
 from ._gui_handles import GuiEvent as GuiEvent
 from ._gui_handles import GuiFolderHandle as GuiFolderHandle
+from ._gui_handles import GuiFormHandle as GuiFormHandle
 from ._gui_handles import GuiHtmlHandle as GuiHtmlHandle
 from ._gui_handles import GuiImageHandle as GuiImageHandle
 from ._gui_handles import GuiInputHandle as GuiInputHandle
@@ -22,12 +28,16 @@ from ._gui_handles import GuiUploadButtonHandle as GuiUploadButtonHandle
 from ._gui_handles import GuiUplotHandle as GuiUplotHandle
 from ._gui_handles import GuiVector2Handle as GuiVector2Handle
 from ._gui_handles import GuiVector3Handle as GuiVector3Handle
+from ._gui_handles import MainPanelHandle as MainPanelHandle
+from ._gui_handles import PanelHandle as PanelHandle
+from ._gui_handles import PlaceableHandle as PlaceableHandle
 from ._gui_handles import UploadedFile as UploadedFile
 from ._icons_enum import Icon as Icon
 from ._icons_enum import IconName as IconName
 from ._notification_handle import NotificationHandle as NotificationHandle
 from ._scene_api import SceneApi as SceneApi
 from ._scene_handles import AmbientLightHandle as AmbientLightHandle
+from ._scene_handles import ArrowsHandle as ArrowsHandle
 from ._scene_handles import BatchedAxesHandle as BatchedAxesHandle
 from ._scene_handles import BatchedGlbHandle as BatchedGlbHandle
 from ._scene_handles import BatchedMeshHandle as BatchedMeshHandle
@@ -51,9 +61,11 @@ from ._scene_handles import MeshSkinnedHandle as MeshSkinnedHandle
 from ._scene_handles import PointCloudHandle as PointCloudHandle
 from ._scene_handles import PointLightHandle as PointLightHandle
 from ._scene_handles import RectAreaLightHandle as RectAreaLightHandle
+from ._scene_handles import SceneClickEvent as SceneClickEvent
+from ._scene_handles import SceneNodeDragEvent as SceneNodeDragEvent
 from ._scene_handles import SceneNodeHandle as SceneNodeHandle
 from ._scene_handles import SceneNodePointerEvent as SceneNodePointerEvent
-from ._scene_handles import ScenePointerEvent as ScenePointerEvent
+from ._scene_handles import SceneRectSelectEvent as SceneRectSelectEvent
 from ._scene_handles import SplineCatmullRomHandle as SplineCatmullRomHandle
 from ._scene_handles import SplineCubicBezierHandle as SplineCubicBezierHandle
 from ._scene_handles import SpotLightHandle as SpotLightHandle
@@ -64,4 +76,10 @@ from ._viser import ClientHandle as ClientHandle
 from ._viser import InitialCameraConfig as InitialCameraConfig
 from ._viser import ViserServer as ViserServer
 
-__version__ = "1.0.21"
+# Legacy alias for ``ScenePointerEvent``: importable at runtime but
+# hidden from type-checkers so users get an early signal to migrate to
+# ``SceneClickEvent`` / ``SceneRectSelectEvent``.
+if not _TYPE_CHECKING:
+    from ._scene_handles import ScenePointerEvent as ScenePointerEvent
+
+__version__ = "1.0.30"

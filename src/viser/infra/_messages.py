@@ -7,7 +7,18 @@ import abc
 import dataclasses
 import functools
 import warnings
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import msgspec.msgpack
 import numpy as np
@@ -26,6 +37,23 @@ def _prepare_for_deserialization(value: Any, annotation: Type) -> Any:
         return float(value)
     elif annotation is int:
         return int(value)
+    elif get_origin(annotation) is Union:
+        # Handle Optional[T] and Union[T1, T2, ...] by finding the best
+        # matching inner type. This avoids needing a blanket lists_to_tuple()
+        # pass over the entire deserialized message.
+        if value is None:
+            return None
+        args = get_args(annotation)
+        for arg in args:
+            if arg is type(None):
+                continue
+            if get_origin(arg) is tuple and isinstance(value, (list, tuple)):
+                return _prepare_for_deserialization(value, arg)
+            if arg is float and isinstance(value, (int, float)):
+                return float(value)
+            if arg is int and isinstance(value, int):
+                return int(value)
+        return value
     elif get_origin(annotation) is tuple:
         out = []
         args = get_args(annotation)
@@ -45,8 +73,20 @@ def _prepare_for_deserialization(value: Any, annotation: Type) -> Any:
     return value
 
 
-def _prepare_for_serialization(value: Any, annotation: object) -> Any:
-    """Prepare any special types for serialization."""
+def _prepare_for_serialization(
+    value: Any,
+    annotation: object,
+    binary_buffers: Optional[List[memoryview]] = None,
+) -> Any:
+    """Prepare any special types for serialization.
+
+    If ``binary_buffers`` is provided, numpy arrays are extracted into it and
+    replaced with tagged placeholder dicts (``{"__binary_index": i, "dtype": "<f4"}``).
+    This pairs with the hybrid wire format where binary data is appended raw
+    after the msgpack payload, enabling zero-copy typed array views on the client.
+
+    If ``binary_buffers`` is None, numpy arrays are inlined as memoryviews
+    in the serialized dict itself."""
     if annotation is Any:
         annotation = type(value)
 
@@ -56,9 +96,24 @@ def _prepare_for_serialization(value: Any, annotation: object) -> Any:
         return float(value)
     if annotation is int or isinstance(value, np.integer):
         return int(value)
+    # np.bool_ (from mask.any(), arr > 0, np.all(...), etc.) is neither
+    # np.floating nor np.integer, and msgpack cannot encode it -- unconverted
+    # it raised inside the broadcast producer, tearing down every client's
+    # connection (and, being a persistent update, re-crashing on reconnect).
+    if annotation is bool or isinstance(value, np.bool_):
+        return bool(value)
+    # Any OTHER numpy scalar msgpack can't encode -- most importantly np.str_
+    # and np.bytes_ from a numpy string array (names[i], labels), which are
+    # far more common than bool. .item() returns the python-native
+    # equivalent. Closes the same crash class as the branches above; without
+    # it a numpy-array-sourced name/label bricked the producer for all
+    # clients. (Placed after float/int/bool so the common numeric paths keep
+    # their explicit fast conversions.)
+    if isinstance(value, np.generic):
+        return value.item()
 
     if dataclasses.is_dataclass(annotation):
-        return _prepare_for_serialization(vars(value), dict)
+        return _prepare_for_serialization(vars(value), dict, binary_buffers)
 
     # Recursively handle tuples.
     if isinstance(value, tuple):
@@ -77,17 +132,32 @@ def _prepare_for_serialization(value: Any, annotation: object) -> Any:
             out.append(
                 # Hack to be OK with wrong type annotations.
                 # https://github.com/nerfstudio-project/nerfstudio/pull/1805
-                _prepare_for_serialization(v, args[i]) if i < len(args) else v
+                _prepare_for_serialization(v, args[i], binary_buffers)
+                if i < len(args)
+                else v
             )
         return tuple(out)
 
-    # For arrays, we serialize underlying data directly. The client is responsible for
-    # reading using the correct dtype.
+    # Handle numpy arrays: extract or inline depending on mode.
     if isinstance(value, np.ndarray):
-        return value.data if value.data.c_contiguous else value.copy().data
+        data = value.data if value.flags.c_contiguous else value.copy().data
+        if binary_buffers is not None:
+            # Extract into separate buffer with tagged placeholder.
+            idx = len(binary_buffers)
+            binary_buffers.append(data)
+            return {"__binary_index": idx, "dtype": value.dtype.str}
+        else:
+            # Inline as memoryview in the serialized dict.
+            return data
+
+    if isinstance(value, list):
+        return [_prepare_for_serialization(v, Any, binary_buffers) for v in value]
 
     if isinstance(value, dict):
-        return {k: _prepare_for_serialization(v, Any) for k, v in value.items()}  # type: ignore
+        return {
+            k: _prepare_for_serialization(v, Any, binary_buffers)
+            for k, v in value.items()
+        }  # type: ignore
 
     return value
 
@@ -107,12 +177,57 @@ class Message(abc.ABC):
     """Don't send this message to a particular client. Useful when a client wants to
     send synchronization information to other clients."""
 
-    def as_serializable_dict(self) -> Dict[str, Any]:
-        """Convert a Python Message object into bytes."""
+    # Entity lifecycle markers. Generic at this layer; application-specific
+    # literals (e.g. EntityType in viser._messages) narrow these in subclasses
+    # via the __init_subclass__ kwargs pattern. The buffer and GC read these
+    # via the Message base to coalesce create/remove and purge stale updates
+    # uniformly across entity types.
+    entity_type: ClassVar[Optional[str]] = None
+    lifecycle_phase: ClassVar[Optional[str]] = None
+    entity_id_field: ClassVar[Optional[str]] = None
+
+    # Required on every viser Message subclass (enforced in
+    # viser._messages.Message.__init_subclass__). Type-only declaration here
+    # so infra-level readers (e.g. the state-serializer filter) can access
+    # the attribute without static errors.
+    include_in_scene_serialization: ClassVar[bool]
+
+    def targets_entity_state(self, entity_type: str, entity_id: str) -> bool:
+        """True for messages that carry PER-ENTITY state for the given entity:
+        update messages declared against it (``update_dict``/``update_simple``
+        with a matching entity id), plus phase-less name-keyed messages whose
+        ``name`` matches (e.g. scene interaction-binding messages). The ONE
+        definition of this taxonomy -- the same-name-replacement purge and the
+        connect-time garbage collector's sweep must never disagree on it."""
+        if self.lifecycle_phase in ("update_dict", "update_simple"):
+            return (
+                self.entity_type == entity_type
+                and self.entity_id_field is not None
+                and getattr(self, self.entity_id_field, None) == entity_id
+            )
+        if self.lifecycle_phase is None:
+            # Name-keyed adjacency exists only for SCENE nodes (interaction
+            # bindings etc.); other entity families key by uuid fields that
+            # never collide with a scene name.
+            return entity_type == "scene" and getattr(self, "name", None) == entity_id
+        return False
+
+    def as_serializable_dict(
+        self, binary_buffers: Optional[List[memoryview]] = None
+    ) -> Dict[str, Any]:
+        """Convert a Python Message object into a serializable dict.
+
+        If ``binary_buffers`` is provided, numpy arrays are extracted into it
+        and replaced with tagged placeholder dicts for the hybrid wire format.
+        Otherwise, arrays are inlined as memoryviews in the returned dict."""
         message_type = type(self)
         hints = get_type_hints_cached(message_type)
+        # Filter to type-hinted fields only -- excludes dynamic attributes
+        # like cached values that shouldn't be serialized.
         out = {
-            k: _prepare_for_serialization(v, hints[k]) for k, v in vars(self).items()
+            k: _prepare_for_serialization(v, hints[k], binary_buffers)
+            for k, v in vars(self).items()
+            if k in hints
         }
         out["type"] = message_type.__name__
         return out
@@ -133,17 +248,10 @@ class Message(abc.ABC):
         """Convert bytes into a Python Message object."""
         mapping = msgspec.msgpack.decode(message)
 
-        # msgpack deserializes to lists by default, but all of our annotations use
-        # tuples.
-        def lists_to_tuple(obj: Any) -> Any:
-            if isinstance(obj, list):
-                return tuple(lists_to_tuple(x) for x in obj)
-            elif isinstance(obj, dict):
-                return {k: lists_to_tuple(v) for k, v in obj.items()}
-            else:
-                return obj
-
-        mapping = lists_to_tuple(mapping)
+        # List-to-tuple conversion is handled per-field in
+        # _prepare_for_deserialization (called from _from_serializable_dict),
+        # which uses type annotations to convert only where needed. This avoids
+        # a blanket recursive traversal of the entire message tree.
         message_type = cls._subclass_from_type_string()[cast(str, mapping.pop("type"))]
         message_kwargs = message_type._from_serializable_dict(mapping)
         return message_type(**message_kwargs)

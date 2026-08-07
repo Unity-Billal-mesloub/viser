@@ -116,3 +116,104 @@ def test_initial_camera_defaults_match():
     assert_close("fov", py_defaults["fov"], ts_defaults["fov"])
     assert_close("near", py_defaults["near"], ts_defaults["near"])
     assert_close("far", py_defaults["far"], ts_defaults["far"])
+
+
+def test_orbit_distance_defaults_match():
+    """Verify that CameraHandle's orbit-distance defaults match the
+    <CameraControls> props in CameraControls.tsx.
+
+    This parity is load-bearing, not cosmetic: the `min_orbit_distance` /
+    `max_orbit_distance` setters early-return when the assigned value equals the
+    Python-side default, so if the client's actual default drifted from Python's,
+    assigning the client-side default from Python would be a silent no-op.
+    """
+    from viser._viser import CameraHandle
+
+    handle = CameraHandle(None)  # type: ignore[arg-type]
+    py_min = handle._state.min_orbit_distance
+    py_max = handle._state.max_orbit_distance
+
+    repo_root = Path(__file__).parent.parent
+    ts_path = repo_root / "src" / "viser" / "client" / "src" / "CameraControls.tsx"
+    ts_content = ts_path.read_text()
+
+    def parse_prop(name: str) -> float:
+        matches = re.findall(rf"{name}=\{{([\d.e+-]+)\}}", ts_content)
+        assert len(matches) == 1, (
+            f"Expected exactly one {name}={{...}} prop in CameraControls.tsx, "
+            f"found {len(matches)}"
+        )
+        return float(matches[0])
+
+    assert math.isclose(py_min, parse_prop("minDistance"), rel_tol=1e-9), (
+        f"min orbit distance mismatch: Python={py_min}, TypeScript prop differs"
+    )
+    assert math.isclose(py_max, parse_prop("maxDistance"), rel_tol=1e-9), (
+        f"max orbit distance mismatch: Python={py_max}, TypeScript prop differs"
+    )
+
+
+class _RecordingConnection:
+    def __init__(self) -> None:
+        self.messages: list = []
+
+    def queue_message(self, message) -> None:
+        self.messages.append(message)
+
+
+class _StubClient:
+    """Minimal stand-in for ClientHandle: just enough for the orbit-distance
+    setters, which only touch ``_websock_connection.queue_message``."""
+
+    def __init__(self) -> None:
+        self._websock_connection = _RecordingConnection()
+
+
+def test_orbit_distance_setter_validation():
+    """The orbit-distance setters reject non-finite / non-positive values and
+    min/max crossings, and validation runs before the no-op short-circuit."""
+    from viser._viser import CameraHandle
+
+    handle = CameraHandle(_StubClient())  # type: ignore[arg-type]
+
+    for bad in (0.0, -1.0, math.nan, math.inf):
+        with pytest.raises(ValueError, match="min_orbit_distance"):
+            handle.min_orbit_distance = bad
+    for bad in (0.0, -1.0, math.nan):
+        with pytest.raises(ValueError, match="max_orbit_distance"):
+            handle.max_orbit_distance = bad
+
+    # Crossings are checked against the other bound's current value.
+    with pytest.raises(ValueError, match="must be <="):
+        handle.min_orbit_distance = handle._state.max_orbit_distance * 2.0
+    with pytest.raises(ValueError, match="must be >="):
+        handle.max_orbit_distance = handle._state.min_orbit_distance / 2.0
+
+    # Rejected assignments must leave state (and the wire) untouched.
+    assert handle._state.min_orbit_distance == 0.01
+    assert handle._state.max_orbit_distance == 1e4
+    assert handle._state.client._websock_connection.messages == []
+
+    # Valid assignments still go through and queue exactly one message each.
+    handle.min_orbit_distance = 0.5
+    handle.max_orbit_distance = 100.0
+    assert handle._state.min_orbit_distance == 0.5
+    assert handle._state.max_orbit_distance == 100.0
+    assert len(handle._state.client._websock_connection.messages) == 2
+
+    # Re-assigning the current value stays a no-op (short-circuit preserved).
+    handle.min_orbit_distance = 0.5
+    assert len(handle._state.client._websock_connection.messages) == 2
+
+    # float("inf") is a valid max: the pre-1.1.0 unbounded behavior, the
+    # opt-out for scenes larger than the 1e4 default.
+    handle.max_orbit_distance = math.inf
+    assert handle._state.max_orbit_distance == math.inf
+    assert len(handle._state.client._websock_connection.messages) == 3
+
+    # But a bad value "close" to the stored one must still raise: validation
+    # runs before the short-circuit.
+    handle_at_floor = CameraHandle(_StubClient())  # type: ignore[arg-type]
+    handle_at_floor._state.min_orbit_distance = 0.0  # Bypass setter.
+    with pytest.raises(ValueError, match="min_orbit_distance"):
+        handle_at_floor.min_orbit_distance = 0.0

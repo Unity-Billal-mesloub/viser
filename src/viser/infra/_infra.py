@@ -18,19 +18,20 @@ from asyncio.events import AbstractEventLoop
 from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any, Callable, Generator, NewType, TypeVar
+from urllib.parse import unquote as _url_unquote
 
 import msgspec.msgpack
 import websockets.asyncio.server
 import websockets.datastructures
 import websockets.exceptions
 import zstandard
-from typing_extensions import Literal, assert_never, override
+from typing_extensions import override
 from websockets import Headers
 from websockets.asyncio.server import ServerConnection
 from websockets.http11 import Request, Response
 from websockets.typing import Subprotocol
 
-import viser  # Import for version checking
+import viser  # Import for version checking.
 
 from ._async_message_buffer import AsyncMessageBuffer
 from ._messages import Message
@@ -58,6 +59,7 @@ class StateSerializer:
         self._handler = handler
         self._filter = filter
         self._time: float = 0.0
+        self._binary_buffers: list[memoryview] = []
         self._messages: list[tuple[float, dict[str, Any]]] = []
 
     def _insert_message(self, message: Message) -> None:
@@ -67,12 +69,20 @@ class StateSerializer:
         # GUI messages.
         if not self._filter(message):
             return
-        self._messages.append((self._time, message.as_serializable_dict()))
+        self._messages.append(
+            (self._time, message.as_serializable_dict(self._binary_buffers))
+        )
 
     def insert_sleep(self, duration: float) -> None:
         """Insert a sleep into the recorded file. This can be useful for
         dynamic 3D data."""
         assert self in self._handler._record_handles, "serialize() was already called!"
+        # A negative sleep would rewind the recording clock, making later
+        # messages carry smaller timestamps -- the player assumes ascending
+        # order and would apply them late or never (and durationSeconds could
+        # fall below a recorded message's time).
+        if duration < 0.0:
+            raise ValueError(f"insert_sleep duration must be >= 0, got {duration}.")
         self._time += duration
 
     def serialize(self) -> bytes:
@@ -85,34 +95,46 @@ class StateSerializer:
         """
         assert self in self._handler._record_handles, "serialize() was already called!"
 
-        packed_bytes = msgspec.msgpack.encode(
+        # Same hybrid format as the live wire path: msgpack metadata with
+        # tagged placeholders for binary arrays, followed by raw aligned
+        # binary data.
+        msgpack_payload = msgspec.msgpack.encode(
             {
                 "durationSeconds": self._time,
                 "messages": self._messages,
                 "viserVersion": viser.__version__,
+                "binaryBufferLengths": tuple(b.nbytes for b in self._binary_buffers),
             }
         )
-        assert isinstance(packed_bytes, bytes)
-        self._handler._record_handles.remove(self)
-        # Use zstd for better compression ratio and speed.
-        # Prepend 8-byte size header for decompressor.
-        compressed = zstandard.ZstdCompressor(level=12).compress(packed_bytes)
-        return len(packed_bytes).to_bytes(8, "little") + compressed
+        assert isinstance(msgpack_payload, bytes)
+        with self._handler._record_lock:
+            self._handler._record_handles.remove(self)
 
-    def show(self, height: int = 400, dark_mode: bool = False) -> None:
-        """Display the serialized scene in a Jupyter notebook or web browser.
+        # Build uncompressed inner payload:
+        #   [8 bytes] msgpack length (little-endian uint64)
+        #   [N bytes] msgpack payload
+        #   [P bytes] padding + aligned binary buffers...
+        msgpack_len_header = len(msgpack_payload).to_bytes(8, "little")
+        parts: list[bytes | memoryview] = [msgpack_len_header, msgpack_payload]
+        _append_aligned_buffers(parts, self._binary_buffers, 8 + len(msgpack_payload))
+        inner = b"".join(parts)
 
-        In Jupyter notebooks/labs, displays an inline IFrame. When running as a
-        script, opens the visualization in the default web browser.
+        # Compress everything together. Recordings aren't latency-sensitive.
+        compressed = zstandard.ZstdCompressor(level=12).compress(inner)
+        return len(inner).to_bytes(8, "little") + compressed
 
-        See also :meth:`viser.ViserServer.show`.
+    def as_html(self, dark_mode: bool = False) -> str:
+        """Get a standalone HTML string for the serialized scene.
+
+        Returns a self-contained HTML document that can be saved to a file
+        or embedded in other contexts.
 
         Args:
-            height: Height of the embedded viewer in pixels.
             dark_mode: Use dark color scheme.
-        """
-        import html as html_module
 
+        Returns:
+            A complete HTML document as a string.
+        """
         scene_bytes = self.serialize()
         scene_b64 = base64.b64encode(scene_bytes).decode("ascii")
 
@@ -129,7 +151,24 @@ class StateSerializer:
             f"window.__VISER_EMBED_CONFIG__={{darkMode:{dark_mode_str}}};"
             f"</script>"
         )
-        modified_html = client_html.replace("</head>", f"{inject_script}</head>")
+        head_end = client_html.index("</head>")
+        return client_html[:head_end] + inject_script + client_html[head_end:]
+
+    def show(self, height: int = 400, dark_mode: bool = False) -> None:
+        """Display the serialized scene in a Jupyter notebook or web browser.
+
+        In Jupyter notebooks/labs, displays an inline IFrame. When running as a
+        script, opens the visualization in the default web browser.
+
+        See also :meth:`viser.ViserServer.show`.
+
+        Args:
+            height: Height of the embedded viewer in pixels.
+            dark_mode: Use dark color scheme.
+        """
+        import html as html_module
+
+        modified_html = self.as_html(dark_mode=dark_mode)
 
         # Display in IPython (Jupyter, Colab, myst-nb, etc.) using srcdoc.
         # This embeds the entire HTML inline, avoiding file serving issues.
@@ -177,8 +216,15 @@ class WebsockMessageHandler:
         self._queued_messages: queue.Queue = queue.Queue()
         self._locked_thread_id = -1
 
-        # List of active serializers recording messages.
+        # List of active serializers recording messages. _record_lock makes
+        # "register a serializer + snapshot existing state" atomic against
+        # queue_message's "feed serializers + push to buffer": without it, a
+        # message queued between registration and the snapshot is recorded
+        # TWICE (once live, once from the snapshot). Reentrant so callers can
+        # hold it across get_message_serializer(). Ordering: _record_lock is
+        # always taken BEFORE the buffer's buffer_lock, never after.
         self._record_handles: list[StateSerializer] = []
+        self._record_lock = threading.RLock()
 
     def get_message_serializer(
         self, filter: Callable[[Message], bool]
@@ -186,7 +232,8 @@ class WebsockMessageHandler:
         """Start recording messages that are sent. Sent messages will be
         serialized and can be used for playback."""
         serializer = StateSerializer(self, filter)
-        self._record_handles.append(serializer)
+        with self._record_lock:
+            self._record_handles.append(serializer)
         return serializer
 
     def register_handler(
@@ -195,9 +242,11 @@ class WebsockMessageHandler:
         callback: Callable[[ClientId, TMessage], None | Coroutine],
     ) -> None:
         """Register a handler for a particular message type."""
-        if message_cls not in self._incoming_handlers:
-            self._incoming_handlers[message_cls] = []
-        self._incoming_handlers[message_cls].append(callback)  # type: ignore
+        # setdefault: registration is reachable from multiple threads (e.g.
+        # concurrent get_render() calls), and an unsynchronized
+        # check-then-create could discard a list another thread just
+        # created+appended to, silently dropping its handler.
+        self._incoming_handlers.setdefault(message_cls, []).append(callback)  # type: ignore
 
     def unregister_handler(
         self,
@@ -218,7 +267,10 @@ class WebsockMessageHandler:
     ) -> None:
         """Handle incoming messages."""
         if type(message) in self._incoming_handlers:
-            for cb in self._incoming_handlers[type(message)]:
+            # Snapshot the list: a handler may unregister itself mid-dispatch
+            # (e.g. get_render's response callback), which would otherwise skip
+            # the next handler in a live iteration.
+            for cb in list(self._incoming_handlers[type(message)]):
                 if asyncio.iscoroutinefunction(cb):
                     await cb(client_id, message)
                 else:
@@ -229,10 +281,14 @@ class WebsockMessageHandler:
 
     def queue_message(self, message: Message) -> None:
         """Wrapped method for sending messages."""
-        for handle in self._record_handles:
-            handle._insert_message(message)
+        # Feed + push under _record_lock so a concurrently-registering
+        # serializer either sees this message in its buffer snapshot OR
+        # records it live -- never both (duplicate) and never neither (loss).
+        with self._record_lock:
+            for handle in self._record_handles:
+                handle._insert_message(message)
 
-        self.get_message_buffer().push(message)
+            self.get_message_buffer().push(message)
 
     @contextlib.contextmanager
     def atomic(self) -> Generator[None, None, None]:
@@ -247,9 +303,16 @@ class WebsockMessageHandler:
             Context manager.
         """
         # If called multiple times in the same thread, we ignore inner calls.
-        self.get_message_buffer().atomic_start()
-        yield
-        self.get_message_buffer().atomic_end()
+        #
+        # try/finally so an exception raised inside the `with` body still
+        # decrements the counter. Otherwise atomic_end() is skipped and the
+        # counter stays stuck != 0, stalling message delivery permanently.
+        buffer = self.get_message_buffer()
+        buffer.atomic_start()
+        try:
+            yield
+        finally:
+            buffer.atomic_end()
 
 
 class WebsockClientConnection(WebsockMessageHandler):
@@ -288,8 +351,6 @@ class WebsockServer(WebsockMessageHandler):
             required in the future.
         http_server_root: Path to root for HTTP server.
         verbose: Toggle for print messages.
-        client_api_version: Flag for backwards compatibility. 0 sends individual
-            messages. 1 sends windowed messages.
     """
 
     def __init__(
@@ -299,8 +360,18 @@ class WebsockServer(WebsockMessageHandler):
         message_class: type[Message] = Message,
         http_server_root: Path | None = None,
         verbose: bool = True,
-        client_api_version: Literal[0, 1] = 0,
+        backlog_done_message: Message | None = None,
     ):
+        """`backlog_done_message`, when given, is sent to each (re)connecting
+        client exactly once, immediately after the broadcast buffer's replay
+        backlog -- an explicit end-of-replay marker (never buffered).
+
+        Servers serving viser's stock client build MUST pass viser's
+        ``ReplayDoneMessage`` here: the client enters a reconnect/replay phase
+        on every (re)connect and leaves it only when this marker arrives, so
+        with the ``None`` default it never exits that phase (degraded panel
+        behavior). ``ViserServer`` does this automatically; it only needs
+        attention when building directly on ``viser.infra.WebsockServer``."""
         super().__init__()
 
         # Track connected clients.
@@ -316,13 +387,27 @@ class WebsockServer(WebsockMessageHandler):
         self._message_class = message_class
         self._http_server_root = http_server_root
         self._verbose = verbose
-        self._client_api_version: Literal[0, 1] = client_api_version
+        self._backlog_done_message = backlog_done_message
         self._background_event_loop: asyncio.AbstractEventLoop | None = None
 
         self._stop_event: asyncio.Event | None = None
 
         self._client_state_from_id: dict[int, _ClientHandleState] = {}
+        # Raw websocket connections of live clients, for disconnect_all_clients.
+        self._live_connections: dict[int, ServerConnection] = {}
         self._server_thread: threading.Thread | None = None
+
+    def disconnect_all_clients(self) -> None:
+        """Forcibly close every live client connection. The server keeps
+        running; clients auto-reconnect and replay. This is the supported way
+        to exercise the reconnect path (e.g. from tests): a network-level drop
+        cannot be scripted from the browser side -- Playwright's `set_offline`
+        does not close already-established localhost websockets."""
+        loop = self._background_event_loop
+        if loop is None:
+            return
+        for connection in tuple(self._live_connections.values()):
+            asyncio.run_coroutine_threadsafe(connection.close(), loop)
 
     def start(self) -> None:
         """Start the server."""
@@ -358,16 +443,28 @@ class WebsockServer(WebsockMessageHandler):
         atexit.unregister(self.stop)
 
         # Signal the background thread to stop.
-        self._background_event_loop.call_soon_threadsafe(self._stop_event.set)
+        try:
+            self._background_event_loop.call_soon_threadsafe(self._stop_event.set)
+        except RuntimeError:
+            # Event loop may already be closed during teardown.
+            pass
 
         # Clean up the message buffers. This isn't really necessary, but helps
         # avoid "task destroyed" errors.
         self._broadcast_buffer.set_done()
-        for client in self._client_state_from_id.values():
+        for client in list(self._client_state_from_id.values()):
             client.message_buffer.set_done()
 
-        # Wait for the server thread to finish.
-        self._server_thread.join(timeout=0.1)
+        # Wait for the server thread to finish. The thread is daemonic, so an
+        # expired timeout never blocks interpreter exit -- but a thread that's
+        # still winding down at interpreter shutdown keeps server state and
+        # user callbacks referenced from its frozen frames, which surfaces as
+        # spurious leak reports from binding frameworks like nanobind. 1s is
+        # generous for the wind-down (~0.5s observed under heavy GIL
+        # contention) and costs nothing when teardown is fast: join() returns
+        # as soon as the thread exits.
+        # https://github.com/viser-project/viser/issues/744
+        self._server_thread.join(timeout=1.0)
 
     def on_client_connect(
         self, cb: Callable[[WebsockClientConnection], None | Coroutine]
@@ -433,25 +530,24 @@ class WebsockServer(WebsockMessageHandler):
                 total_connections += 1
 
             # Version check to make sure Viser server/client match.
-            if self._client_api_version == 1:
-                import viser
+            import viser
 
-                # Extract client version from the selected subprotocol.
-                client_version_str = "unknown"
-                if connection.subprotocol is not None:
-                    if connection.subprotocol.startswith("viser-v"):
-                        client_version_str = connection.subprotocol[7:].strip()
+            # Extract client version from the selected subprotocol.
+            client_version_str = "unknown"
+            if connection.subprotocol is not None:
+                if connection.subprotocol.startswith("viser-v"):
+                    client_version_str = connection.subprotocol[7:].strip()
 
-                if client_version_str != viser.__version__:
-                    rich.print(
-                        f"[bold red](viser)[/bold red] Version mismatch - connection rejected. "
-                        f"Client: '{client_version_str}', Server: '{viser.__version__}'"
-                    )
-                    await connection.close(
-                        1002,
-                        f"Version mismatch. Client: {client_version_str}, Server: {viser.__version__}",
-                    )
-                    return  # Exit handler to prevent further processing.
+            if client_version_str != viser.__version__:
+                rich.print(
+                    f"[bold red](viser)[/bold red] Version mismatch - connection rejected. "
+                    f"Client: '{client_version_str}', Server: '{viser.__version__}'"
+                )
+                await connection.close(
+                    1002,
+                    f"Version mismatch. Client: {client_version_str}, Server: {viser.__version__}",
+                )
+                return  # Exit handler to prevent further processing.
 
             client_state = _ClientHandleState(
                 AsyncMessageBuffer(event_loop, persistent_messages=False),
@@ -459,6 +555,7 @@ class WebsockServer(WebsockMessageHandler):
             )
             client_connection = WebsockClientConnection(client_id, client_state)
             self._client_state_from_id[client_id] = client_state
+            self._live_connections[client_id] = connection
 
             def handle_incoming(message: Message) -> None:
                 event_loop.create_task(
@@ -483,28 +580,52 @@ class WebsockServer(WebsockMessageHandler):
                     " messages"
                 )
 
-            try:
-                # For each client: infinite loop over producers (which send messages)
-                # and consumers (which receive messages).
-                await asyncio.gather(
+            # For each client: infinite loop over producers (which send
+            # messages) and consumers (which receive messages). Explicit
+            # tasks, because gather() does NOT cancel siblings when one
+            # raises: the consumer's ConnectionClosed left the broadcast
+            # producer parked on message_event.wait() as a zombie -- its
+            # window generator's finally (which releases the GC cursor) then
+            # ran only when the NEXT broadcast woke it, and on a quiet server
+            # the stale cursor pinned the GC deletion floor indefinitely.
+            producer_consumer_tasks = [
+                asyncio.create_task(coro)
+                for coro in (
                     _message_producer(
                         connection,
                         client_state.message_buffer,
                         client_id,
-                        self._client_api_version,
                     ),
                     _message_producer(
                         connection,
                         self._broadcast_buffer,
                         client_id,
-                        self._client_api_version,
+                        # End-of-replay marker: rides the BROADCAST buffer only
+                        # (the per-client buffer has no persistent backlog).
+                        backlog_done_message=self._backlog_done_message,
                     ),
                     _message_consumer(connection, handle_incoming, message_class),
                 )
+            ]
+            try:
+                await asyncio.gather(*producer_consumer_tasks)
             except (
                 websockets.exceptions.ConnectionClosedOK,
                 websockets.exceptions.ConnectionClosedError,
             ):
+                # Expected disconnects -- swallow. Any other exit (CancelledError
+                # on shutdown, an exception from a producer/consumer) still runs
+                # the teardown below via `finally`, so client state can't leak
+                # and disconnect callbacks always fire.
+                pass
+            finally:
+                # Tear down the surviving siblings NOW (cancellation runs the
+                # broadcast window generator's finally, releasing its GC
+                # cursor deterministically); await them so no task outlives
+                # its connection.
+                for task in producer_consumer_tasks:
+                    task.cancel()
+                await asyncio.gather(*producer_consumer_tasks, return_exceptions=True)
                 # We use a sentinel value to signal that the client producer thread
                 # should exit.
                 #
@@ -513,16 +634,26 @@ class WebsockServer(WebsockMessageHandler):
                 # pending" error.
                 client_state.message_buffer.set_done()
 
+                # Remove client state up front, before the disconnect callbacks:
+                # a callback that raises (or a CancelledError delivered at an
+                # `await` inside this finally) must not be able to skip it and
+                # leak the client. `pop(..., None)` keeps this idempotent.
+                self._client_state_from_id.pop(client_id, None)
+                self._live_connections.pop(client_id, None)
+                # Drop this connection's broadcast GC cursor HERE, not only in
+                # the generator's own finally: the idle broadcast producer can
+                # stay parked (same zombie hazard as the explicit-tasks note
+                # above), so its finally may not have run. pop() is idempotent
+                # with the generator's own cleanup, whichever runs first.
+                self._broadcast_buffer.generator_cursors.pop(client_id, None)
+                total_connections -= 1
+
                 # Disconnection callbacks.
                 for cb in self._client_disconnect_cb:
                     if asyncio.iscoroutinefunction(cb):
                         await cb(client_connection)
                     else:
                         cb(client_connection)
-
-                # Cleanup.
-                self._client_state_from_id.pop(client_id)
-                total_connections -= 1
                 if self._verbose:
                     rich.print(
                         f"[bold](viser)[/bold] Connection closed ({client_id},"
@@ -562,16 +693,39 @@ class WebsockServer(WebsockMessageHandler):
             if request.headers.get("Upgrade") == "websocket":
                 return None
 
-            # Strip out search params, get relative path.
+            # Strip out search params, get relative path. URL-decode so
+            # percent-encoded traversal sequences (e.g. ``%2e%2e/``)
+            # can't slip past the segment check below; normalize
+            # backslashes to forward slashes so a Windows-style path
+            # like ``foo\..\bar`` is also caught on Linux, where
+            # ``pathlib`` would otherwise treat the whole thing as a
+            # single literal filename.
             path = request.path
             path = path.partition("?")[0]
-            relpath = str(Path(path).relative_to("/"))
-            if relpath == ".":
-                relpath = "index.html"
-            assert http_server_root is not None
+            path = _url_unquote(path).replace("\\", "/")
 
+            # Reject path traversal by checking URL segments, not by
+            # comparing resolved paths. Under Bazel/uv runfile trees,
+            # http_server_root and the files inside it can pass through
+            # independent symlinks (e.g. uv hardlinks individual files
+            # from a shared cache), so Path.resolve() places a
+            # legitimate child outside the resolved root.
+            #
+            # Skipping the resolved-path check means we no longer
+            # validate that symlinks inside http_server_root stay
+            # within it. That is fine here: http_server_root is set
+            # by the application, not by user input, so the only
+            # attacker-controlled component is the URL path.
+            segments = [s for s in path.split("/") if s and s != "."]
+            if any(s == ".." for s in segments):
+                return Response(http.HTTPStatus.NOT_FOUND, "NOT FOUND", Headers())
+            relpath = "/".join(segments) if segments else "index.html"
+            assert http_server_root is not None
             source_path = http_server_root / relpath
-            if not source_path.exists():
+            # ``is_file()`` (not ``exists()``) so a request resolving to a
+            # directory returns a clean 404 instead of raising
+            # ``IsADirectoryError`` on ``read_bytes()`` below (-> a 500).
+            if not source_path.is_file():
                 return Response(http.HTTPStatus.NOT_FOUND, "NOT FOUND", Headers())
 
             use_gzip = "gzip" in request.headers.get("Accept-Encoding", "")
@@ -657,7 +811,16 @@ class WebsockServer(WebsockMessageHandler):
                         ),
                     ) as serve_future:
                         assert serve_future.server is not None
-                        self._port = port_attempt
+                        # Report the port actually BOUND, not the one
+                        # requested: with port=0 the OS assigns an ephemeral
+                        # port, and echoing the 0 back made get_port() (and
+                        # the printed URLs) useless.
+                        bound_sockets = serve_future.server.sockets
+                        self._port = (
+                            bound_sockets[0].getsockname()[1]
+                            if bound_sockets
+                            else port_attempt
+                        )
                         ready_sem.release()
                         assert self._stop_event is not None
                         await self._stop_event.wait()
@@ -669,47 +832,96 @@ class WebsockServer(WebsockMessageHandler):
         event_loop.run_until_complete(start_server())
         rich.print("[bold](viser)[/bold] Server stopped")
 
-        # Clean up the event loop to prevent reference leaks
+        # Clean up the event loop to prevent reference leaks.
         event_loop.stop()
         event_loop.close()
+
+
+# Pre-allocated padding bytes for 8-byte alignment.
+_ALIGNMENT_PADDING = tuple(b"\x00" * i for i in range(8))
+
+
+def _append_aligned_buffers(
+    parts: list[bytes | memoryview],
+    binary_buffers: list[memoryview],
+    current_offset: int,
+) -> None:
+    """Append binary buffers to `parts` with 8-byte alignment padding."""
+    for buf in binary_buffers:
+        padding = (8 - (current_offset % 8)) % 8
+        if padding:
+            parts.append(_ALIGNMENT_PADDING[padding])
+            current_offset += padding
+        parts.append(buf)
+        current_offset += buf.nbytes
 
 
 async def _message_producer(
     websocket: ServerConnection,
     buffer: AsyncMessageBuffer,
     client_id: int,
-    client_api_version: Literal[0, 1],
+    backlog_done_message: Message | None = None,
 ) -> None:
-    """Infinite loop to broadcast windows of messages from a buffer."""
-    window_generator = buffer.window_generator(client_id)
-    zstd = zstandard.ZstdCompressor(level=1)
-    while not buffer.done:
-        try:
-            outgoing = await window_generator.__anext__()
-        except StopAsyncIteration:
-            break
+    """Infinite loop to broadcast windows of messages from a buffer.
 
-        if client_api_version == 1:
-            # Encode the message structure.
+    Wire format (hybrid zstd-compressed msgpack + raw binary buffers):
+    - Binary arrays (numpy) are extracted from messages and replaced with
+      tagged placeholder dicts so msgpack.encode() doesn't walk large arrays.
+    - Raw binary data is appended uncompressed after the zstd-compressed
+      msgpack, with 8-byte alignment padding.
+    - On the JS side, typed array views (Float32Array, etc.) are created
+      directly into the WebSocket's ArrayBuffer -- zero-copy for binary data.
+
+    Binary data is left uncompressed because float/int arrays (point clouds,
+    meshes) compress poorly, and at 30-60fps the zstd compress+decompress
+    cost adds up. Zero-copy is more valuable than modest compression.
+
+    Layout:
+      [8 bytes] decompressed size of msgpack (little-endian uint64)
+      [8 bytes] compressed size of msgpack (little-endian uint64)
+      [N bytes] zstd-compressed msgpack payload
+      [P bytes] padding to 8-byte alignment
+      [M bytes] concatenated binary buffers (each 8-byte aligned)
+    """
+    window_generator = buffer.window_generator(
+        client_id, backlog_done_message=backlog_done_message
+    )
+    zstd = zstandard.ZstdCompressor(level=1)
+    try:
+        while not buffer.done:
+            try:
+                outgoing = await window_generator.__anext__()
+            except StopAsyncIteration:
+                break
+
+            binary_buffers: list[memoryview] = []
+            serialized_messages = tuple(
+                message.as_serializable_dict(binary_buffers) for message in outgoing
+            )
             inner = msgspec.msgpack.encode(
                 {
-                    "messages": tuple(
-                        message.as_serializable_dict() for message in outgoing
-                    ),
+                    "messages": serialized_messages,
                     "timestampSec": time.perf_counter(),
+                    "binaryBufferLengths": tuple(b.nbytes for b in binary_buffers),
                 }
             )
-            # Compress and prepend size header (8 bytes, little-endian uint64).
             compressed = zstd.compress(inner)
-            serialized = len(inner).to_bytes(8, "little") + compressed
-            await websocket.send(serialized)
-        elif client_api_version == 0:
-            for msg in outgoing:
-                serialized = msgspec.msgpack.encode(msg.as_serializable_dict())
-                assert isinstance(serialized, bytes)
-                await websocket.send(serialized)
-        else:
-            assert_never(client_api_version)
+
+            parts: list[bytes | memoryview] = [
+                len(inner).to_bytes(8, "little"),
+                len(compressed).to_bytes(8, "little"),
+                compressed,
+            ]
+            _append_aligned_buffers(parts, binary_buffers, 16 + len(compressed))
+            await websocket.send(b"".join(parts))
+    finally:
+        # Close the generator DETERMINISTICALLY. A cancellation delivered at
+        # `websocket.send` leaves the generator suspended at its yield --
+        # exiting the async-for does NOT close it, so its finallys (the GC
+        # cursor pop, the flush-waiter cancel) would otherwise run only at a
+        # later garbage-collection pass. aclose() raises GeneratorExit at the
+        # yield and runs them now, before this producer task completes.
+        await window_generator.aclose()
 
 
 async def _message_consumer(

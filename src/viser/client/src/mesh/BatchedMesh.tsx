@@ -1,10 +1,12 @@
 import React, { useMemo } from "react";
 import * as THREE from "three";
-import { createStandardMaterial } from "./MeshUtils";
+import { createStandardMaterial } from "./meshMaterialUtils";
 import { BatchedMeshesMessage } from "../WebsocketMessages";
-import { InstancedMesh2 } from "@three.ez/instanced-mesh";
+import { InstancedMesh2 } from "../vendor/instanced-mesh/index.js";
 import { ViewerContext } from "../ViewerContext";
 import { BatchedMeshBase } from "./BatchedMeshBase";
+import { normalizeScale } from "../utils/normalizeScale";
+import { shallowArrayEqual } from "../utils/shallowArrayEqual";
 
 /**
  * Component for rendering batched/instanced meshes
@@ -15,7 +17,16 @@ export const BatchedMesh = React.forwardRef<
 >(function BatchedMesh({ children, ...message }, ref) {
   const viewer = React.useContext(ViewerContext)!;
   const clickable =
-    viewer.useSceneTree((state) => state[message.name]?.clickable) ?? false;
+    (viewer.useSceneTree(message.name, (node) => node?.clickBindings?.length) ??
+      0) > 0;
+  const draggable =
+    (
+      viewer.useSceneTree(
+        message.name,
+        (node) => node?.dragBindings,
+        shallowArrayEqual,
+      ) ?? []
+    ).length > 0;
 
   // Create a material based on the message props.
   const material = useMemo(() => {
@@ -29,13 +40,15 @@ export const BatchedMesh = React.forwardRef<
       side: message.props.side,
     });
 
-    // Set transparent flag if any transparency is involved.
-    if (
+    // Set the transparent flag explicitly in both directions:
+    // createStandardMaterial marks the material transparent whenever opacity
+    // is non-null, including opacity=1.0, which would needlessly put fully
+    // opaque meshes in the transparent render pass and (since transparency
+    // now enables per-frame instance depth sorting) pay a sort cost for no
+    // visual difference.
+    mat.transparent =
       (message.props.opacity !== null && message.props.opacity < 1.0) ||
-      message.props.batched_opacities !== null
-    ) {
-      mat.transparent = true;
-    }
+      message.props.batched_opacities !== null;
 
     return mat;
   }, [
@@ -47,54 +60,59 @@ export const BatchedMesh = React.forwardRef<
     message.props.side,
   ]);
 
+  // Clean up material when it changes.
+  React.useEffect(() => {
+    return () => {
+      material.dispose();
+    };
+  }, [material]);
+
   // Setup geometry using memoization.
   const geometry = useMemo(() => {
     const geometry = new THREE.BufferGeometry();
+    // Vertices and faces arrive as Float32Array / Uint32Array views.
     geometry.setAttribute(
       "position",
-      new THREE.BufferAttribute(
-        new Float32Array(
-          message.props.vertices.buffer.slice(
-            message.props.vertices.byteOffset,
-            message.props.vertices.byteOffset +
-              message.props.vertices.byteLength,
-          ),
-        ),
-        3,
-      ),
+      new THREE.BufferAttribute(message.props.vertices, 3),
     );
-    geometry.setIndex(
-      new THREE.BufferAttribute(
-        new Uint32Array(
-          message.props.faces.buffer.slice(
-            message.props.faces.byteOffset,
-            message.props.faces.byteOffset + message.props.faces.byteLength,
-          ),
-        ),
-        1,
-      ),
-    );
+    geometry.setIndex(new THREE.BufferAttribute(message.props.faces, 1));
     geometry.computeVertexNormals();
     geometry.computeBoundingSphere();
     return geometry;
-  }, [message.props.vertices.buffer, message.props.faces.buffer]);
+    // Keyed on the VIEWS, not their .buffer (BasicMesh's pattern): in a
+    // playback recording every array is a view on ONE shared ArrayBuffer,
+    // so .buffer identity never changes and a geometry update would
+    // silently keep the old mesh. Pose-stream props (batched_positions
+    // etc.) keep their identity across unrelated updates, so this does not
+    // rebuild per frame.
+  }, [message.props.vertices, message.props.faces]);
+
+  // Clean up geometry when it changes.
+  React.useEffect(() => {
+    return () => {
+      geometry.dispose();
+    };
+  }, [geometry]);
 
   return (
     <group ref={ref}>
-      <BatchedMeshBase
-        geometry={geometry}
-        material={material}
-        batched_positions={message.props.batched_positions}
-        batched_wxyzs={message.props.batched_wxyzs}
-        batched_scales={message.props.batched_scales}
-        batched_colors={message.props.batched_colors}
-        opacity={message.props.opacity}
-        batched_opacities={message.props.batched_opacities}
-        lod={message.props.lod}
-        cast_shadow={message.props.cast_shadow}
-        receive_shadow={message.props.receive_shadow}
-        clickable={clickable}
-      />
+      <group scale={normalizeScale(message.props.scale)}>
+        <BatchedMeshBase
+          geometry={geometry}
+          material={material}
+          batched_positions={message.props.batched_positions}
+          batched_wxyzs={message.props.batched_wxyzs}
+          batched_scales={message.props.batched_scales}
+          batched_colors={message.props.batched_colors}
+          opacity={message.props.opacity}
+          batched_opacities={message.props.batched_opacities}
+          lod={message.props.lod}
+          cast_shadow={message.props.cast_shadow}
+          receive_shadow={message.props.receive_shadow}
+          clickable={clickable}
+          draggable={draggable}
+        />
+      </group>
       {children}
     </group>
   );
