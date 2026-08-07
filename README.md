@@ -5,8 +5,8 @@
 </h1>
 
 <p align="left">
-    <img alt="pyright" src="https://github.com/viser-project/viser/actions/workflows/pyright.yml/badge.svg" />
-    <img alt="typescript-compile" src="https://github.com/viser-project/viser/actions/workflows/typescript-compile.yml/badge.svg" />
+    <img alt="pyright" src="https://github.com/Unity-Billal-mesloub/viser/actions/workflows/pyright.yml/badge.svg" />
+    <img alt="typescript-compile" src="https://github.com/Unity-Billal-mesloub/viser/actions/workflows/typescript-compile.yml/badge.svg" />
     <a href="https://pypi.org/project/viser/">
         <img alt="codecov" src="https://img.shields.io/pypi/pyversions/viser" />
     </a>
@@ -56,18 +56,18 @@ To cite Viser in your work, you can use the BibTeX for our [technical report](ht
 ## Acknowledgements
 
 `viser` is heavily inspired by packages like
-[Pangolin](https://github.com/stevenlovegrove/Pangolin),
-[Dear ImGui](https://github.com/ocornut/imgui),
+[Pangolin](https://github.com/Unity-most-beautiful-games/Pangolin),
+[Dear ImGui](https://github.com/Unity-Billal-mesloub/imgui),
 [rviz](https://wiki.ros.org/rviz/),
-[meshcat](https://github.com/rdeits/meshcat), and
-[Gradio](https://github.com/gradio-app/gradio).
+[meshcat](https://github.com/Unity-Billal-mesloub/meshcat), and
+[Gradio](https://github.com/Unity-Billal-mesloub/gradio).
 
 The web client is implemented using [React](https://react.dev/), with:
 
 - [Vite](https://vitejs.dev/) / [Rollup](https://rollupjs.org/) for bundling
-- [three.js](https://threejs.org/) via [react-three-fiber](https://github.com/pmndrs/react-three-fiber) and [drei](https://github.com/pmndrs/drei)
+- [three.js](https://threejs.org/) via [react-three-fiber](https://github.com/Unity-Billal-mesloub/react-three-fiber) and [drei](https://github.com/pmndrs/drei)
 - [Mantine](https://mantine.dev/) for UI components
-- [zustand](https://github.com/pmndrs/zustand) for state management
+- [zustand](https://github.com/Unity-Billal-mesloub/zustand) for state management
 - [vanilla-extract](https://vanilla-extract.style/) for stylesheets
 
 Thanks to the authors of these projects for open-sourcing their work!
