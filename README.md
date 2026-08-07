@@ -70,4 +70,3 @@ The web client is implemented using [React](https://react.dev/), with:
 - [zustand](https://github.com/Unity-Billal-mesloub/zustand) for state management
 - [vanilla-extract](https://vanilla-extract.style/) for stylesheets
 
-Thanks to the authors of these projects for open-sourcing their work!
